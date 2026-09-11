@@ -1,0 +1,303 @@
+#include <iostream>
+#include <vector>
+#include <deque>
+#include <string>
+#include <iomanip>
+#include <algorithm>
+
+using namespace std;
+
+enum class Estado { NUEVO, LISTO, EJECUCION, BLOQUEADO, TERMINADO };
+
+struct Proceso {
+    int id;
+    string nombre;
+    int tiempo_llegada;      
+    int tiempo_irrupcion;    
+    int prioridad_alerta;  
+    int tamano_datos_mb;    
+
+    Estado estado;
+    int restante;
+    int ejecutado;
+    bool ya_hizo_io;
+    int bloqueo_restante;
+    int punto_bloqueo;     
+    int tiempo_primera_cpu;  
+    int tiempo_fin;
+    int tiempo_espera;       
+};
+
+constexpr int DURACION_IO = 2;    
+constexpr int QUANTUM_RR  = 3;     
+constexpr int MAX_TICKS   = 200;    
+
+vector<Proceso> crear_procesos_siget() {
+   
+    return {
+        {1, "Analisis_flujo_Av80",             0, 8,  3, 120},
+        {2, "Alerta_choque_Interseccion12",    1, 4,  1,  15},
+        {3, "Sincronizacion_semaforos_Centro", 2, 6,  2,  60},
+        {4, "Reporte_congestion_diario",       3, 10, 4, 200},
+        {5, "Alerta_peaton_Zona_escolar",      5, 3,  1,  10},
+    };
+}
+
+void inicializar(vector<Proceso>& p) {
+    for (auto& pr : p) {
+        pr.estado = Estado::NUEVO;
+        pr.restante = pr.tiempo_irrupcion;
+        pr.ejecutado = 0;
+        pr.ya_hizo_io = false;
+        pr.bloqueo_restante = 0;
+        pr.punto_bloqueo = max(1, pr.tiempo_irrupcion / 2);
+        pr.tiempo_primera_cpu = -1;
+        pr.tiempo_fin = -1;
+        pr.tiempo_espera = 0;
+    }
+}
+
+bool todos_terminados(const vector<Proceso>& p) {
+    for (auto& pr : p) if (pr.estado != Estado::TERMINADO) return false;
+    return true;
+}
+
+
+const char* SEP_LARGO =
+    "---------|------------------------------------|--------------------------|--------------------------------\n";
+
+void encabezado_traza() {
+    printf("%s", SEP_LARGO);
+    printf("%8s  |  %-34s  |  %-24s  |  %s\n", "TICK", "PROCESO", "TRANSICION", "DETALLE");
+    printf("%s", SEP_LARGO);
+}
+
+
+void fila_traza(int t, const Proceso& p, const string& transicion, const string& detalle, int& last_tick_visto) {
+    if (last_tick_visto != -999 && t != last_tick_visto) {
+        printf("\n");   
+    }
+    last_tick_visto = t;
+    printf("%8d  |  %-34s  |  %-24s  |  %s\n", t, p.nombre.c_str(), transicion.c_str(), detalle.c_str());
+}
+
+void imprimir_metricas(const string& titulo, const vector<Proceso>& p, int tiempo_total) {
+    cout << "\n\n>>> METRICAS -- " << titulo << "\n\n";
+    printf("%-34s  %-10s  %-9s  %-9s  %-11s  %-9s\n",
+           "Proceso", "Llegada", "Rafaga", "Espera", "Respuesta", "Retorno");
+    printf("---------------------------------------------------------------------------------------\n");
+
+    double suma_espera = 0, suma_retorno = 0, suma_respuesta = 0;
+    for (auto& pr : p) {
+        int retorno = pr.tiempo_fin - pr.tiempo_llegada;
+        int respuesta = pr.tiempo_primera_cpu - pr.tiempo_llegada;
+        suma_espera += pr.tiempo_espera;
+        suma_retorno += retorno;
+        suma_respuesta += respuesta;
+        printf("%-34s  %-10d  %-9d  %-9d  %-11d  %-9d\n",
+               pr.nombre.c_str(), pr.tiempo_llegada, pr.tiempo_irrupcion,
+               pr.tiempo_espera, respuesta, retorno);
+    }
+    int n = (int)p.size();
+
+    printf("\n");
+    printf("Promedios  ->  espera: %.2f  |  respuesta: %.2f  |  retorno: %.2f\n",
+           suma_espera / n, suma_respuesta / n, suma_retorno / n);
+    printf("Tiempo total de simulacion: %d ticks\n", tiempo_total);
+
+    printf("\nAlertas criticas (prioridad_alerta = 1):\n\n");
+    for (auto& pr : p) {
+        if (pr.prioridad_alerta == 1) {
+            printf("   %-34s  respuesta = %-4d ticks   retorno = %-4d ticks\n",
+                   pr.nombre.c_str(), pr.tiempo_primera_cpu - pr.tiempo_llegada,
+                   pr.tiempo_fin - pr.tiempo_llegada);
+        }
+    }
+}
+
+void simular_round_robin(vector<Proceso> procesos) {
+    inicializar(procesos);
+    cout << "\n\n";
+    cout << "=================================================================\n";
+    cout << "  SIMULACION: ROUND ROBIN  (quantum = " << QUANTUM_RR << ")\n";
+    cout << "=================================================================\n";
+    encabezado_traza();
+
+    deque<int> listos;
+    int en_ejecucion = -1;
+    int quantum_usado = 0;
+    int t = 0;
+    int last_tick_visto = -999;
+
+    while (!todos_terminados(procesos) && t < MAX_TICKS) {
+        for (auto& p : procesos) {
+            if (p.estado == Estado::NUEVO && p.tiempo_llegada == t) {
+                p.estado = Estado::LISTO;
+                listos.push_back(p.id - 1);
+                fila_traza(t, p, "Nuevo -> Listo", "llega al sistema", last_tick_visto);
+            }
+        }
+        for (auto& p : procesos) {
+            if (p.estado == Estado::BLOQUEADO) {
+                p.bloqueo_restante--;
+                if (p.bloqueo_restante == 0) {
+                    p.estado = Estado::LISTO;
+                    listos.push_back(p.id - 1);
+                    fila_traza(t, p, "Bloqueado -> Listo", "E/S completada", last_tick_visto);
+                }
+            }
+        }
+        if (en_ejecucion == -1 && !listos.empty()) {
+            en_ejecucion = listos.front(); listos.pop_front();
+            quantum_usado = 0;
+            procesos[en_ejecucion].estado = Estado::EJECUCION;
+            fila_traza(t, procesos[en_ejecucion], "Listo -> Ejecucion", "asignado por turno RR", last_tick_visto);
+        }
+        for (int idx : listos) procesos[idx].tiempo_espera++;
+
+        if (en_ejecucion != -1) {
+            Proceso& p = procesos[en_ejecucion];
+            if (p.tiempo_primera_cpu == -1) p.tiempo_primera_cpu = t;
+            p.restante--; p.ejecutado++; quantum_usado++;
+
+            if (p.restante == 0) {
+                p.estado = Estado::TERMINADO;
+                p.tiempo_fin = t + 1;
+                fila_traza(t + 1, p, "Ejecucion -> Terminado", "-", last_tick_visto);
+                en_ejecucion = -1;
+            } else if (!p.ya_hizo_io && p.ejecutado >= p.punto_bloqueo) {
+                p.ya_hizo_io = true;
+                p.estado = Estado::BLOQUEADO;
+                p.bloqueo_restante = DURACION_IO;
+                fila_traza(t + 1, p, "Ejecucion -> Bloqueado", "solicita E/S", last_tick_visto);
+                en_ejecucion = -1;
+            } else if (quantum_usado == QUANTUM_RR) {
+                p.estado = Estado::LISTO;
+                listos.push_back(en_ejecucion);
+                fila_traza(t + 1, p, "Ejecucion -> Listo", "quantum agotado", last_tick_visto);
+                en_ejecucion = -1;
+            }
+        }
+        t++;
+    }
+    printf("%s", SEP_LARGO);
+    imprimir_metricas("Round Robin", procesos, t);
+}
+
+void simular_prioridad(vector<Proceso> procesos) {
+    inicializar(procesos);
+    cout << "\n\n";
+    cout << "=================================================================\n";
+    cout << "  SIMULACION: PRIORIDAD PREEMPTIVA\n";
+    cout << "=================================================================\n";
+    encabezado_traza();
+
+    vector<int> listos;
+    int en_ejecucion = -1;
+    int t = 0;
+    int last_tick_visto = -999;
+
+    auto elegir_mas_prioritario = [&](vector<int>& candidatos) -> int {
+        int mejor = -1;
+        for (int idx : candidatos) {
+            if (mejor == -1 || procesos[idx].prioridad_alerta < procesos[mejor].prioridad_alerta ||
+                (procesos[idx].prioridad_alerta == procesos[mejor].prioridad_alerta &&
+                 procesos[idx].tiempo_llegada < procesos[mejor].tiempo_llegada)) {
+                mejor = idx;
+            }
+        }
+        return mejor;
+    };
+
+    while (!todos_terminados(procesos) && t < MAX_TICKS) {
+        for (auto& p : procesos) {
+            if (p.estado == Estado::NUEVO && p.tiempo_llegada == t) {
+                p.estado = Estado::LISTO;
+                listos.push_back(p.id - 1);
+                string det = "llega al sistema (prioridad " + to_string(p.prioridad_alerta) + ")";
+                fila_traza(t, p, "Nuevo -> Listo", det, last_tick_visto);
+            }
+        }
+        for (auto& p : procesos) {
+            if (p.estado == Estado::BLOQUEADO) {
+                p.bloqueo_restante--;
+                if (p.bloqueo_restante == 0) {
+                    p.estado = Estado::LISTO;
+                    listos.push_back(p.id - 1);
+                    fila_traza(t, p, "Bloqueado -> Listo", "E/S completada", last_tick_visto);
+                }
+            }
+        }
+        if (!listos.empty()) {
+            int candidato = elegir_mas_prioritario(listos);
+            if (en_ejecucion == -1) {
+                en_ejecucion = candidato;
+                listos.erase(remove(listos.begin(), listos.end(), candidato), listos.end());
+                procesos[en_ejecucion].estado = Estado::EJECUCION;
+                fila_traza(t, procesos[en_ejecucion], "Listo -> Ejecucion", "mayor prioridad disponible", last_tick_visto);
+            } else if (procesos[candidato].prioridad_alerta < procesos[en_ejecucion].prioridad_alerta) {
+                Proceso& actual = procesos[en_ejecucion];
+                actual.estado = Estado::LISTO;
+                listos.push_back(en_ejecucion);
+                fila_traza(t, actual, "Ejecucion -> Listo", "desalojado por alerta mas urgente", last_tick_visto);
+
+                listos.erase(remove(listos.begin(), listos.end(), candidato), listos.end());
+                en_ejecucion = candidato;
+                procesos[en_ejecucion].estado = Estado::EJECUCION;
+                fila_traza(t, procesos[en_ejecucion], "Listo -> Ejecucion", "atiende la emergencia", last_tick_visto);
+            }
+        }
+        for (int idx : listos) procesos[idx].tiempo_espera++;
+
+        if (en_ejecucion != -1) {
+            Proceso& p = procesos[en_ejecucion];
+            if (p.tiempo_primera_cpu == -1) p.tiempo_primera_cpu = t;
+            p.restante--; p.ejecutado++;
+
+            if (p.restante == 0) {
+                p.estado = Estado::TERMINADO;
+                p.tiempo_fin = t + 1;
+                fila_traza(t + 1, p, "Ejecucion -> Terminado", "-", last_tick_visto);
+                en_ejecucion = -1;
+            } else if (!p.ya_hizo_io && p.ejecutado >= p.punto_bloqueo) {
+                p.ya_hizo_io = true;
+                p.estado = Estado::BLOQUEADO;
+                p.bloqueo_restante = DURACION_IO;
+                fila_traza(t + 1, p, "Ejecucion -> Bloqueado", "solicita E/S", last_tick_visto);
+                en_ejecucion = -1;
+            }
+        }
+        t++;
+    }
+    printf("%s", SEP_LARGO);
+    imprimir_metricas("Prioridad preemptiva", procesos, t);
+}
+
+int main() {
+    vector<Proceso> procesos = crear_procesos_siget();
+
+    cout << "=================================================================\n";
+    cout << "  SIGET: SIMULADOR DEL PLANIFICADOR DE CPU\n";
+    cout << "=================================================================\n\n";
+    cout << "Procesos del motor de procesamiento de datos:\n\n";
+    for (auto& p : procesos) {
+        printf("  - %-34s  llegada=%-3d  rafaga=%-3d  prioridad_alerta=%-2d  datos=%d MB\n",
+               p.nombre.c_str(), p.tiempo_llegada, p.tiempo_irrupcion, p.prioridad_alerta, p.tamano_datos_mb);
+    }
+
+    simular_round_robin(procesos);
+    simular_prioridad(procesos);
+
+    cout << "\n\n";
+    cout << "=================================================================\n";
+    cout << "  COMPARACION FINAL\n";
+    cout << "=================================================================\n\n";
+    cout << "Round Robin reparte la CPU de forma equitativa: es predecible y evita\n"
+         << "la inanicion, pero una alerta critica puede esperar varios turnos\n"
+         << "detras de tareas rutinarias de gran tamano de datos.\n\n"
+         << "Prioridad preemptiva minimiza la latencia de las alertas (prioridad 1),\n"
+         << "porque desaloja de inmediato cualquier tarea rutinaria en curso, a costa\n"
+         << "de aumentar el tiempo de espera de las tareas de baja prioridad.\n\n";
+
+    return 0;
+}
